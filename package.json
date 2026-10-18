@@ -1,0 +1,68 @@
+{
+  "name": "mock-llm-server",
+  "version": "0.1.0",
+  "description": "Fake OpenAI- and Anthropic-compatible API server that returns scripted replies, tool calls, errors and streams, so you can test agents without API keys. Zero dependencies.",
+  "keywords": [
+    "llm",
+    "mock",
+    "fake",
+    "openai",
+    "anthropic",
+    "claude",
+    "testing",
+    "test",
+    "agent",
+    "streaming",
+    "sse",
+    "tool-calling",
+    "responses-api"
+  ],
+  "homepage": "https://github.com/acus9345/mock-llm-server#readme",
+  "bugs": {
+    "url": "https://github.com/acus9345/mock-llm-server/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/acus9345/mock-llm-server.git"
+  },
+  "license": "MIT",
+  "author": "acus9345 <acus9345@gmail.com>",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "mock-llm-server": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && tsc -p tsconfig.build.json",
+    "prelint": "npm run build",
+    "lint": "tsc -p tsconfig.json",
+    "pretest": "npm run build",
+    "test": "node --test \"test/*.test.ts\"",
+    "prepack": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "typescript": "^7.0.2",
+    "openai": "^7.38.0",
+    "@anthropic-ai/sdk": "^0.135.0"
+  }
+}
