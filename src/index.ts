@@ -1,5 +1,5 @@
 /**
- * A fake OpenAI- and Anthropic-compatible API server for testing agents without API keys.
+ * A fake OpenAI-, Anthropic- and Gemini-compatible API server for testing agents without API keys.
  *
  * @example
  * import OpenAI from "openai";
@@ -13,4 +13,4 @@
  */
 export { checkJsonReply, parseJsonRule, startMockLLM } from "./server.js";
 export type { MockLLM, MockOptions } from "./server.js";
-export type { Matcher, RecordedRequest, Reply, ReplyError, ReplyObject, ToolCall } from "./types.js";
+export type { Matcher, RecordedRequest, Reply, ReplyError, ReplyObject, StreamError, ToolCall } from "./types.js";

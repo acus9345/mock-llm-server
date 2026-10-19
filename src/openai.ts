@@ -1,6 +1,6 @@
 import type { ServerResponse } from "node:http";
 import type { RecordedRequest, ResolvedReply } from "./types.js";
-import { chunkText, contentText, sendJson, SseWriter, unixSeconds } from "./util.js";
+import { chunkText, contentText, sendJson, sseEvent, SseWriter, unixSeconds, type StreamFailure } from "./util.js";
 
 type Parsed = Pick<RecordedRequest, "system" | "messages" | "lastUserMessage" | "tools">;
 
@@ -49,14 +49,25 @@ const FINISH: Record<ResolvedReply["stopReason"], string> = {
   content_filter: "content_filter",
 };
 
-export async function writeChat(res: ServerResponse, reply: ResolvedReply, req: RecordedRequest, id: string): Promise<void> {
+export async function writeChat(
+  res: ServerResponse,
+  reply: ResolvedReply,
+  req: RecordedRequest,
+  id: string,
+  failure?: StreamFailure,
+): Promise<void> {
   const created = unixSeconds();
   const usage = {
     prompt_tokens: reply.inputTokens,
     completion_tokens: reply.outputTokens,
     total_tokens: reply.inputTokens + reply.outputTokens,
-    prompt_tokens_details: { cached_tokens: 0, audio_tokens: 0 },
-    completion_tokens_details: { reasoning_tokens: 0, audio_tokens: 0, accepted_prediction_tokens: 0, rejected_prediction_tokens: 0 },
+    prompt_tokens_details: { cached_tokens: reply.cachedInputTokens, audio_tokens: 0 },
+    completion_tokens_details: {
+      reasoning_tokens: reply.reasoningTokens,
+      audio_tokens: 0,
+      accepted_prediction_tokens: 0,
+      rejected_prediction_tokens: 0,
+    },
   };
   const toolCalls = reply.toolCalls.map((t) => ({ id: t.id, type: "function", function: { name: t.name, arguments: t.arguments } }));
 
@@ -72,6 +83,8 @@ export async function writeChat(res: ServerResponse, reply: ResolvedReply, req: 
           message: {
             role: "assistant",
             content: reply.text === "" && toolCalls.length > 0 ? null : reply.text,
+            // Not part of OpenAI's API, but what DeepSeek, vLLM and similar servers send.
+            ...(reply.reasoning === "" ? {} : { reasoning_content: reply.reasoning }),
             refusal: null,
             annotations: [],
             ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
@@ -87,21 +100,24 @@ export async function writeChat(res: ServerResponse, reply: ResolvedReply, req: 
     return;
   }
 
-  const sse = new SseWriter(res, reply.chunkDelayMs);
+  const sse = new SseWriter(res, reply.chunkDelayMs, {}, failure);
   const base = { id, object: "chat.completion.chunk", created, model: reply.model, service_tier: "default", system_fingerprint: "fp_mock" };
   const chunk = (delta: Record<string, unknown>, finish: string | null = null) => ({
     ...base,
     choices: [{ index: 0, delta, logprobs: null, finish_reason: finish }],
   });
   await sse.send(chunk({ role: "assistant", content: "", refusal: null }));
-  for (const piece of chunkText(reply.text, reply.chunkSize)) await sse.send(chunk({ content: piece }));
+  for (const piece of chunkText(reply.reasoning, reply.chunkSize)) {
+    await sse.send(chunk({ reasoning_content: piece }), undefined, "delta");
+  }
+  for (const piece of chunkText(reply.text, reply.chunkSize)) await sse.send(chunk({ content: piece }), undefined, "delta");
   for (const [index, call] of reply.toolCalls.entries()) {
     await sse.send(chunk({ tool_calls: [{ index, id: call.id, type: "function", function: { name: call.name, arguments: "" } }] }));
     for (const piece of chunkText(call.arguments, reply.chunkSize ?? 8)) {
-      await sse.send(chunk({ tool_calls: [{ index, function: { arguments: piece } }] }));
+      await sse.send(chunk({ tool_calls: [{ index, function: { arguments: piece } }] }), undefined, "delta");
     }
   }
-  await sse.send(chunk({}, FINISH[reply.stopReason]));
+  await sse.send(chunk({}, FINISH[reply.stopReason]), undefined, "final");
   const options = req.body.stream_options as { include_usage?: boolean } | undefined;
   if (options?.include_usage) await sse.send({ ...base, choices: [], usage });
   await sse.send("[DONE]");
@@ -114,11 +130,15 @@ export async function writeResponses(
   req: RecordedRequest,
   id: string,
   nextId: (prefix: string) => string,
+  failure?: StreamFailure,
 ): Promise<void> {
   const created = unixSeconds();
   const incomplete = reply.stopReason === "length" || reply.stopReason === "content_filter";
-  const messageId = nextId("msg_mock_");
   const items: Record<string, unknown>[] = [];
+  if (reply.reasoning !== "") {
+    items.push({ id: nextId("rs_mock_"), type: "reasoning", summary: [{ type: "summary_text", text: reply.reasoning }] });
+  }
+  const messageId = nextId("msg_mock_");
   if (reply.text !== "" || reply.toolCalls.length === 0) {
     items.push({
       id: messageId,
@@ -167,9 +187,9 @@ export async function writeResponses(
         ? null
         : {
             input_tokens: reply.inputTokens,
-            input_tokens_details: { cached_tokens: 0 },
+            input_tokens_details: { cached_tokens: reply.cachedInputTokens },
             output_tokens: reply.outputTokens,
-            output_tokens_details: { reasoning_tokens: 0 },
+            output_tokens_details: { reasoning_tokens: reply.reasoningTokens },
             total_tokens: reply.inputTokens + reply.outputTokens,
           },
     user: body.user ?? null,
@@ -182,13 +202,24 @@ export async function writeResponses(
     return;
   }
 
-  const sse = new SseWriter(res, reply.chunkDelayMs);
+  const sse = new SseWriter(res, reply.chunkDelayMs, {}, failure);
   let seq = 0;
-  const emit = (type: string, data: Record<string, unknown>) => sse.send({ type, sequence_number: seq++, ...data }, type);
+  const emit = (type: string, data: Record<string, unknown>, kind?: "delta" | "final") =>
+    sse.send({ type, sequence_number: seq++, ...data }, type, kind);
   await emit("response.created", { response: response("in_progress", []) });
   await emit("response.in_progress", { response: response("in_progress", []) });
   for (const [outputIndex, item] of items.entries()) {
-    if (item.type === "message") {
+    if (item.type === "reasoning") {
+      await emit("response.output_item.added", { output_index: outputIndex, item: { ...item, summary: [] } });
+      const part = { type: "summary_text", text: "" };
+      const at = { item_id: item.id, output_index: outputIndex, summary_index: 0 };
+      await emit("response.reasoning_summary_part.added", { ...at, part });
+      for (const delta of chunkText(reply.reasoning, reply.chunkSize)) {
+        await emit("response.reasoning_summary_text.delta", { ...at, delta }, "delta");
+      }
+      await emit("response.reasoning_summary_text.done", { ...at, text: reply.reasoning });
+      await emit("response.reasoning_summary_part.done", { ...at, part: { ...part, text: reply.reasoning } });
+    } else if (item.type === "message") {
       await emit("response.output_item.added", {
         output_index: outputIndex,
         item: { ...item, status: "in_progress", content: [] },
@@ -196,13 +227,11 @@ export async function writeResponses(
       const part = { type: "output_text", text: "", annotations: [], logprobs: [] };
       await emit("response.content_part.added", { item_id: item.id, output_index: outputIndex, content_index: 0, part });
       for (const delta of chunkText(reply.text, reply.chunkSize)) {
-        await emit("response.output_text.delta", {
-          item_id: item.id,
-          output_index: outputIndex,
-          content_index: 0,
-          delta,
-          logprobs: [],
-        });
+        await emit(
+          "response.output_text.delta",
+          { item_id: item.id, output_index: outputIndex, content_index: 0, delta, logprobs: [] },
+          "delta",
+        );
       }
       await emit("response.output_text.done", {
         item_id: item.id,
@@ -224,7 +253,7 @@ export async function writeResponses(
         item: { ...item, status: "in_progress", arguments: "" },
       });
       for (const delta of chunkText(args, reply.chunkSize ?? 8)) {
-        await emit("response.function_call_arguments.delta", { item_id: item.id, output_index: outputIndex, delta });
+        await emit("response.function_call_arguments.delta", { item_id: item.id, output_index: outputIndex, delta }, "delta");
       }
       await emit("response.function_call_arguments.done", {
         item_id: item.id,
@@ -235,7 +264,7 @@ export async function writeResponses(
     }
     await emit("response.output_item.done", { output_index: outputIndex, item });
   }
-  await emit(incomplete ? "response.incomplete" : "response.completed", { response: response(finalStatus, items) });
+  await emit(incomplete ? "response.incomplete" : "response.completed", { response: response(finalStatus, items) }, "final");
   sse.end();
 }
 
@@ -259,6 +288,13 @@ export function errorBody(error: NonNullable<ResolvedReply["error"]>): Record<st
       code,
     },
   };
+}
+
+/** The SSE event that ends a Chat Completions or Responses stream with an error. */
+export function streamErrorEvent(api: string, error: NonNullable<ResolvedReply["error"]>): string {
+  const body = (errorBody(error) as { error: Record<string, unknown> }).error;
+  if (api === "chat.completions") return sseEvent({ error: body });
+  return sseEvent({ type: "error", code: body.code ?? body.type, message: body.message, param: null, sequence_number: 0 }, "error");
 }
 
 /** Deterministic, unit-length fake embedding for a string. */

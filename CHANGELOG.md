@@ -2,6 +2,16 @@
 
 All notable changes to this project are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] - 2026-10-19
+
+### Added
+
+- Gemini's native API: `generateContent`, `streamGenerateContent`, `countTokens`, `embedContent`, `batchEmbedContents` and the model list, tested with `@google/genai`. `mock.geminiBaseURL` is the base URL to pass to the SDK.
+- `reasoning` replies: an Anthropic `thinking` block with a signature, an OpenAI Responses `reasoning` item with a summary, a Gemini thought part, and `reasoning_content` in Chat Completions. All of them stream.
+- `streamError` replies that end a stream with the provider's error event after a number of chunks, or drop the connection.
+- `usage.cachedInputTokens`, `usage.cacheWriteTokens` and `usage.reasoningTokens`, sent in each provider's usage fields.
+- `mock.waitForRequests(count, { timeoutMs })` and the `GET /__mock/wait` admin route, for agents that run in the background.
+
 ## [0.1.0] - 2026-10-18
 
 ### Added
@@ -14,4 +24,5 @@ All notable changes to this project are documented here. This project follows [S
 - Error replies send `retry-after-ms: 0` so SDK retries happen at once.
 - `mock-llm-server` CLI with a JSON script file and HTTP admin routes (`/__mock/replies`, `/__mock/rules`, `/__mock/requests`, `/__mock/reset`) for tests in other languages.
 
+[0.2.0]: https://github.com/acus9345/mock-llm-server/releases/tag/v0.2.0
 [0.1.0]: https://github.com/acus9345/mock-llm-server/releases/tag/v0.1.0

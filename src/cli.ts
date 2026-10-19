@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { checkJsonReply, parseJsonRule, startMockLLM, type MockOptions, type Reply } from "./index.js";
 
-const HELP = `mock-llm-server - fake OpenAI and Anthropic API for tests
+const HELP = `mock-llm-server - fake OpenAI, Anthropic and Gemini API for tests
 
 Usage:
   mock-llm-server [--port 8787] [--script replies.json] [options]
@@ -36,6 +36,7 @@ While it runs, tests in any language can script it over HTTP:
   POST /__mock/replies   queue a reply or an array of replies
   POST /__mock/rules     add a rule or an array of rules
   GET  /__mock/requests  list recorded requests
+  GET  /__mock/wait      wait until ?count=N requests have arrived (?timeoutMs=5000)
   POST /__mock/reset     clear replies, rules and requests
 `;
 
@@ -130,6 +131,7 @@ async function main(argv: string[]): Promise<number> {
     `mock-llm-server listening on ${mock.url}\n` +
       `  OpenAI base URL:    ${mock.openaiBaseURL}\n` +
       `  Anthropic base URL: ${mock.anthropicBaseURL}\n` +
+      `  Gemini base URL:    ${mock.geminiBaseURL}\n` +
       `Press Ctrl+C to stop.\n`,
   );
   const stop = () => {

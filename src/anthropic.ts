@@ -1,6 +1,6 @@
 import type { ServerResponse } from "node:http";
 import type { RecordedRequest, ResolvedReply } from "./types.js";
-import { chunkText, contentText, sendJson, SseWriter } from "./util.js";
+import { chunkText, contentText, sendJson, sseEvent, SseWriter, type StreamFailure } from "./util.js";
 
 type Parsed = Pick<RecordedRequest, "system" | "messages" | "lastUserMessage" | "tools">;
 
@@ -35,8 +35,16 @@ const STOP: Record<ResolvedReply["stopReason"], string> = {
   content_filter: "refusal",
 };
 
-export async function writeMessages(res: ServerResponse, reply: ResolvedReply, req: RecordedRequest, id: string): Promise<void> {
+export async function writeMessages(
+  res: ServerResponse,
+  reply: ResolvedReply,
+  req: RecordedRequest,
+  id: string,
+  failure?: StreamFailure,
+): Promise<void> {
   const blocks: Record<string, unknown>[] = [];
+  const signature = Buffer.from(`mock-signature:${id}`).toString("base64");
+  if (reply.reasoning !== "") blocks.push({ type: "thinking", thinking: reply.reasoning, signature });
   if (reply.text !== "" || reply.toolCalls.length === 0) blocks.push({ type: "text", text: reply.text });
   for (const call of reply.toolCalls) {
     blocks.push({ type: "tool_use", id: call.id, name: call.name, input: JSON.parse(call.arguments || "{}") });
@@ -44,8 +52,8 @@ export async function writeMessages(res: ServerResponse, reply: ResolvedReply, r
   const usage = {
     input_tokens: reply.inputTokens,
     output_tokens: reply.outputTokens,
-    cache_creation_input_tokens: 0,
-    cache_read_input_tokens: 0,
+    cache_creation_input_tokens: reply.cacheWriteTokens,
+    cache_read_input_tokens: reply.cachedInputTokens,
     service_tier: "standard",
   };
   const message = (content: unknown[], stop: string | null, u: object) => ({
@@ -64,14 +72,23 @@ export async function writeMessages(res: ServerResponse, reply: ResolvedReply, r
     return;
   }
 
-  const sse = new SseWriter(res, reply.chunkDelayMs, { "request-id": `req_${id}` });
+  const sse = new SseWriter(res, reply.chunkDelayMs, { "request-id": `req_${id}` }, failure);
   await sse.send({ type: "message_start", message: message([], null, { ...usage, output_tokens: 1 }) }, "message_start");
   for (const [index, block] of blocks.entries()) {
-    if (block.type === "text") {
+    if (index === 0) await sse.send({ type: "ping" }, "ping");
+    if (block.type === "thinking") {
+      await sse.send(
+        { type: "content_block_start", index, content_block: { type: "thinking", thinking: "", signature: "" } },
+        "content_block_start",
+      );
+      for (const thinking of chunkText(reply.reasoning, reply.chunkSize)) {
+        await sse.send({ type: "content_block_delta", index, delta: { type: "thinking_delta", thinking } }, "content_block_delta", "delta");
+      }
+      await sse.send({ type: "content_block_delta", index, delta: { type: "signature_delta", signature } }, "content_block_delta");
+    } else if (block.type === "text") {
       await sse.send({ type: "content_block_start", index, content_block: { type: "text", text: "" } }, "content_block_start");
-      if (index === 0) await sse.send({ type: "ping" }, "ping");
       for (const text of chunkText(reply.text, reply.chunkSize)) {
-        await sse.send({ type: "content_block_delta", index, delta: { type: "text_delta", text } }, "content_block_delta");
+        await sse.send({ type: "content_block_delta", index, delta: { type: "text_delta", text } }, "content_block_delta", "delta");
       }
     } else {
       await sse.send(
@@ -83,6 +100,7 @@ export async function writeMessages(res: ServerResponse, reply: ResolvedReply, r
         await sse.send(
           { type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json } },
           "content_block_delta",
+          "delta",
         );
       }
     }
@@ -95,6 +113,7 @@ export async function writeMessages(res: ServerResponse, reply: ResolvedReply, r
       usage: { output_tokens: reply.outputTokens },
     },
     "message_delta",
+    "final",
   );
   await sse.send({ type: "message_stop" }, "message_stop");
   sse.end();
@@ -112,6 +131,11 @@ const ERROR_TYPES: Record<number, string> = {
   504: "timeout_error",
   529: "overloaded_error",
 };
+
+/** The SSE event that ends a Messages stream with an error. */
+export function streamErrorEvent(error: NonNullable<ResolvedReply["error"]>): string {
+  return sseEvent(errorBody(error), "error");
+}
 
 export function errorBody(error: NonNullable<ResolvedReply["error"]>): Record<string, unknown> {
   return {

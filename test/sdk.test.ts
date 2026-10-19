@@ -2,35 +2,8 @@ import Anthropic from "@anthropic-ai/sdk";
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, it } from "node:test";
 import OpenAI from "openai";
-import { createServer, connect } from "node:net";
 import { startMockLLM, type MockLLM } from "../dist/index.js";
-
-/** Some VPN and firewall drivers drop loopback TCP segments written after a pause. Detect that. */
-async function loopbackDeliversLateWrites(): Promise<boolean> {
-  const server = createServer((s) => {
-    s.write("a");
-    setTimeout(() => s.end("b"), 30);
-  });
-  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
-  const { port } = server.address() as { port: number };
-  const c = connect(port, "127.0.0.1");
-  try {
-    return await new Promise<boolean>((done) => {
-      let got = "";
-      const timer = setTimeout(() => done(false), 1000);
-      c.on("data", (d) => (got += String(d)));
-      c.on("end", () => {
-        clearTimeout(timer);
-        done(got === "ab");
-      });
-      c.on("error", () => done(false));
-    });
-  } finally {
-    c.destroy();
-    server.close();
-    server.unref();
-  }
-}
+import { loopbackDeliversLateWrites } from "./helpers.ts";
 
 let mock: MockLLM;
 let openai: OpenAI;

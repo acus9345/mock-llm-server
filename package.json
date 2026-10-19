@@ -1,7 +1,7 @@
 {
   "name": "mock-llm-server",
-  "version": "0.1.0",
-  "description": "Fake OpenAI- and Anthropic-compatible API server that returns scripted replies, tool calls, errors and streams, so you can test agents without API keys. Zero dependencies.",
+  "version": "0.2.0",
+  "description": "Fake OpenAI-, Anthropic- and Gemini-compatible API server that returns scripted replies, tool calls, reasoning, errors and streams, so you can test agents without API keys. Zero dependencies.",
   "keywords": [
     "llm",
     "mock",
@@ -15,7 +15,9 @@
     "streaming",
     "sse",
     "tool-calling",
-    "responses-api"
+    "responses-api",
+    "gemini",
+    "reasoning"
   ],
   "homepage": "https://github.com/acus9345/mock-llm-server#readme",
   "bugs": {
@@ -60,9 +62,10 @@
     "prepack": "npm run build"
   },
   "devDependencies": {
+    "@anthropic-ai/sdk": "^0.135.0",
+    "@google/genai": "^2.27.0",
     "@types/node": "^24.19.2",
-    "typescript": "^7.0.2",
     "openai": "^7.38.0",
-    "@anthropic-ai/sdk": "^0.135.0"
+    "typescript": "^7.0.2"
   }
 }

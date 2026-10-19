@@ -1,9 +1,19 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import * as anthropic from "./anthropic.js";
+import * as gemini from "./gemini.js";
 import * as openai from "./openai.js";
 import type { Matcher, RecordedRequest, Reply, ReplyObject, ResolvedReply } from "./types.js";
-import { estimateTokens, sendJson, sleep } from "./util.js";
+import { estimateTokens, sendJson, sleep, type StreamFailure } from "./util.js";
+
+type Provider = RecordedRequest["provider"];
+type ReplyErrorInfo = NonNullable<ResolvedReply["error"]>;
+
+function errorBody(provider: Provider, error: ReplyErrorInfo): Record<string, unknown> {
+  if (provider === "anthropic") return anthropic.errorBody(error);
+  if (provider === "gemini") return gemini.errorBody(error);
+  return openai.errorBody(error);
+}
 
 export interface MockOptions {
   /** Port to listen on. Default 0 (a free port). */
@@ -44,6 +54,8 @@ export interface MockLLM {
   readonly openaiBaseURL: string;
   /** Pass as `baseURL` to the Anthropic SDK: `<url>`. */
   readonly anthropicBaseURL: string;
+  /** Pass as `httpOptions.baseUrl` to the Google Gen AI SDK: `<url>`. */
+  readonly geminiBaseURL: string;
   /** Every model request received, oldest first. */
   readonly requests: RecordedRequest[];
   /** The most recent model request. */
@@ -54,6 +66,11 @@ export interface MockLLM {
   reply(...replies: Reply[]): this;
   /** Answer requests that match with `reply`, every time or only `times` times. Rules are checked before the queue. */
   on(match: Matcher, reply: Reply, options?: { times?: number }): this;
+  /**
+   * Resolve once `count` model requests have arrived in total (default: one more than now), for agents
+   * that run in the background. Rejects after `timeoutMs` (default 5000).
+   */
+  waitForRequests(count?: number, options?: { timeoutMs?: number }): Promise<RecordedRequest[]>;
   /** Throw if queued replies were never used. */
   assertDone(): void;
   /** Clear the queue, rules and recorded requests. */
@@ -67,6 +84,7 @@ export async function startMockLLM(options: MockOptions = {}): Promise<MockLLM> 
   const queue: Reply[] = [...(options.replies ?? [])];
   const rules: Rule[] = [];
   const requests: RecordedRequest[] = [];
+  const waiters = new Set<() => void>();
   const counters = new Map<string, number>();
   const nextId = (prefix: string) => {
     const n = (counters.get(prefix) ?? 0) + 1;
@@ -105,11 +123,20 @@ export async function startMockLLM(options: MockOptions = {}): Promise<MockLLM> 
     const url = new URL(req.url ?? "/", "http://localhost");
     const path = url.pathname.replace(/\/+$/, "");
     const route = path.replace(/^\/v1(?=\/)/, "");
-    const isAnthropic = "anthropic-version" in req.headers || "x-api-key" in req.headers;
+    const geminiRoute = gemini.parseRoute(path);
+    const headerProvider: Provider =
+      "anthropic-version" in req.headers || "x-api-key" in req.headers
+        ? "anthropic"
+        : "x-goog-api-key" in req.headers || /^\/v1(beta|alpha)\//.test(path)
+          ? "gemini"
+          : "openai";
 
-    if (path.startsWith("/__mock/")) return admin(path, req, res);
-    if (req.method === "GET" && route === "/models") return listModels(res, isAnthropic);
-    if (req.method !== "POST") return notFound(res, req.method, path, isAnthropic);
+    if (path.startsWith("/__mock/")) return admin(path, url, req, res);
+    if (req.method === "GET" && (route === "/models" || /^\/v1(beta|alpha)\/models$/.test(path))) {
+      return listModels(res, headerProvider);
+    }
+    if (req.method !== "POST") return notFound(res, req.method, path, headerProvider);
+    if (geminiRoute) return handleGemini(geminiRoute, path, req, res);
 
     const api =
       route === "/chat/completions"
@@ -123,17 +150,11 @@ export async function startMockLLM(options: MockOptions = {}): Promise<MockLLM> 
               : route === "/messages/count_tokens"
                 ? "count_tokens"
                 : undefined;
-    if (!api) return notFound(res, req.method, path, isAnthropic);
+    if (!api) return notFound(res, req.method, path, headerProvider);
     const provider = api === "messages" || api === "count_tokens" ? "anthropic" : "openai";
 
-    let body: Record<string, unknown>;
-    try {
-      body = JSON.parse((await readBody(req)) || "{}") as Record<string, unknown>;
-      if (body === null || typeof body !== "object" || Array.isArray(body)) throw new Error("not an object");
-    } catch {
-      const err = { status: 400, retryAfterMs: 0, message: "mock-llm-server: request body is not a JSON object." };
-      return sendJson(res, 400, provider === "anthropic" ? anthropic.errorBody(err) : openai.errorBody(err));
-    }
+    const body = await readJsonBody(req, res, provider);
+    if (!body) return;
 
     const parsed =
       api === "chat.completions"
@@ -143,20 +164,17 @@ export async function startMockLLM(options: MockOptions = {}): Promise<MockLLM> 
           : provider === "anthropic"
             ? anthropic.parseMessages(body)
             : { system: "", messages: [], lastUserMessage: "", tools: [] };
-    const recorded: RecordedRequest = {
-      index: requests.length + 1,
+    const recorded = record({
       provider,
       api,
-      method: req.method,
+      method: req.method ?? "POST",
       path,
-      headers: Object.fromEntries(Object.entries(req.headers).map(([k, v]) => [k, Array.isArray(v) ? v.join(", ") : (v ?? "")])),
+      headers: req.headers,
       body,
       model: typeof body.model === "string" ? body.model : "mock-model",
       stream: body.stream === true,
       ...parsed,
-    };
-    requests.push(recorded);
-    options.onRequest?.(recorded);
+    });
     await sleep(options.latencyMs ?? 0);
 
     if (api === "embeddings") return embeddings(res, body);
@@ -164,12 +182,72 @@ export async function startMockLLM(options: MockOptions = {}): Promise<MockLLM> 
       return sendJson(res, 200, { input_tokens: estimateTokens(JSON.stringify([parsed.system, parsed.messages, body.tools ?? []])) });
     }
 
+    const reply = await prepareReply(recorded, res);
+    if (!reply) return;
+    if (api === "chat.completions") return openai.writeChat(res, reply.reply, recorded, nextId("chatcmpl-mock-"), reply.failure);
+    if (api === "responses") return openai.writeResponses(res, reply.reply, recorded, nextId("resp_mock_"), nextId, reply.failure);
+    return anthropic.writeMessages(res, reply.reply, recorded, nextId("msg_mock_"), reply.failure);
+  }
+
+  async function handleGemini(
+    route: { model: string; method: string },
+    path: string,
+    req: IncomingMessage,
+    res: ServerResponse,
+  ): Promise<void> {
+    const generate = route.method === "generateContent" || route.method === "streamGenerateContent";
+    const api = generate
+      ? "generate_content"
+      : route.method === "countTokens"
+        ? "count_tokens"
+        : route.method === "embedContent" || route.method === "batchEmbedContents"
+          ? "embeddings"
+          : undefined;
+    if (!api) return notFound(res, req.method, path, "gemini");
+    const body = await readJsonBody(req, res, "gemini");
+    if (!body) return;
+    const recorded = record({
+      provider: "gemini",
+      api,
+      method: req.method ?? "POST",
+      path,
+      headers: req.headers,
+      body,
+      model: route.model,
+      stream: route.method === "streamGenerateContent",
+      ...(generate ? gemini.parseGenerate(body) : { system: "", messages: [], lastUserMessage: "", tools: [] }),
+    });
+    await sleep(options.latencyMs ?? 0);
+    if (api === "count_tokens") return sendJson(res, 200, gemini.countTokens(body));
+    if (api === "embeddings") return sendJson(res, 200, gemini.embed(route.method, body));
+    const reply = await prepareReply(recorded, res);
+    if (!reply) return;
+    return gemini.writeGenerate(res, reply.reply, recorded, nextId("mock-response-"), reply.failure);
+  }
+
+  function record(fields: Omit<RecordedRequest, "index" | "headers"> & { headers: IncomingMessage["headers"] }): RecordedRequest {
+    const recorded: RecordedRequest = {
+      ...fields,
+      index: requests.length + 1,
+      headers: Object.fromEntries(Object.entries(fields.headers).map(([k, v]) => [k, Array.isArray(v) ? v.join(", ") : (v ?? "")])),
+    };
+    requests.push(recorded);
+    options.onRequest?.(recorded);
+    for (const wake of waiters) wake();
+    return recorded;
+  }
+
+  /** Pick and resolve the reply, and send it right away if it's an error. Returns what the writers need. */
+  async function prepareReply(
+    recorded: RecordedRequest,
+    res: ServerResponse,
+  ): Promise<{ reply: ResolvedReply; failure: StreamFailure | undefined } | undefined> {
+    const provider = recorded.provider;
     const reply = await resolve(recorded);
     if (typeof reply === "string") {
-      const err = { status: 400, retryAfterMs: 0, message: reply, type: "mock_no_reply" };
-      return sendJson(res, 400, provider === "anthropic" ? anthropic.errorBody(err) : openai.errorBody(err), {
-        "x-should-retry": "false",
-      });
+      const err = { status: 400, retryAfterMs: 0, message: reply, type: provider === "gemini" ? "FAILED_PRECONDITION" : "mock_no_reply" };
+      sendJson(res, 400, errorBody(provider, err), { "x-should-retry": "false" });
+      return undefined;
     }
     await sleep(reply.delayMs);
     if (reply.error) {
@@ -177,16 +255,73 @@ export async function startMockLLM(options: MockOptions = {}): Promise<MockLLM> 
         "retry-after-ms": String(reply.error.retryAfterMs),
         "retry-after": String(Math.ceil(reply.error.retryAfterMs / 1000)),
       };
-      const errBody = provider === "anthropic" ? anthropic.errorBody(reply.error) : openai.errorBody(reply.error);
-      return sendJson(res, reply.error.status, errBody, headers);
+      sendJson(res, reply.error.status, errorBody(provider, reply.error), headers);
+      return undefined;
     }
-    if (api === "chat.completions") return openai.writeChat(res, reply, recorded, nextId("chatcmpl-mock-"));
-    if (api === "responses") return openai.writeResponses(res, reply, recorded, nextId("resp_mock_"), nextId);
-    return anthropic.writeMessages(res, reply, recorded, nextId("msg_mock_"));
+    const streamError = reply.streamError;
+    if (!streamError) return { reply, failure: undefined };
+    const err = { status: streamError.status, retryAfterMs: 0, message: streamError.message, ...(streamError.type ? { type: streamError.type } : {}) };
+    if (!recorded.stream) {
+      // A request that isn't streamed fails as a whole.
+      if (streamError.disconnect) res.destroy();
+      else sendJson(res, err.status, errorBody(provider, err), { "x-should-retry": "false" });
+      return undefined;
+    }
+    const errorEvent =
+      provider === "anthropic"
+        ? anthropic.streamErrorEvent(err)
+        : provider === "gemini"
+          ? gemini.streamErrorEvent(err)
+          : openai.streamErrorEvent(recorded.api, err);
+    return { reply, failure: { afterChunks: streamError.afterChunks, disconnect: streamError.disconnect, errorEvent } };
   }
 
-  async function admin(path: string, req: IncomingMessage, res: ServerResponse): Promise<void> {
+  async function readJsonBody(req: IncomingMessage, res: ServerResponse, provider: Provider): Promise<Record<string, unknown> | undefined> {
+    try {
+      const body = JSON.parse((await readBody(req)) || "{}") as unknown;
+      if (body === null || typeof body !== "object" || Array.isArray(body)) throw new Error("not an object");
+      return body as Record<string, unknown>;
+    } catch {
+      const err = { status: 400, retryAfterMs: 0, message: "mock-llm-server: request body is not a JSON object." };
+      sendJson(res, 400, errorBody(provider, err));
+      return undefined;
+    }
+  }
+
+  function waitForRequests(count: number, timeoutMs: number): Promise<RecordedRequest[]> {
+    if (requests.length >= count) return Promise.resolve([...requests]);
+    return new Promise((done, fail) => {
+      const check = () => {
+        if (requests.length < count) return;
+        cleanup();
+        done([...requests]);
+      };
+      const timer = setTimeout(() => {
+        cleanup();
+        fail(new Error(`mock-llm-server: waited ${timeoutMs} ms for ${count} request(s), got ${requests.length}.`));
+      }, timeoutMs);
+      const cleanup = () => {
+        clearTimeout(timer);
+        waiters.delete(check);
+      };
+      waiters.add(check);
+    });
+  }
+
+  async function admin(path: string, url: URL, req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (req.method === "GET" && path === "/__mock/requests") return sendJson(res, 200, requests);
+    if (req.method === "GET" && path === "/__mock/wait") {
+      const count = Number(url.searchParams.get("count") ?? requests.length + 1);
+      const timeoutMs = Number(url.searchParams.get("timeoutMs") ?? 5000);
+      if (!Number.isInteger(count) || count < 1 || !Number.isFinite(timeoutMs) || timeoutMs < 0) {
+        return sendJson(res, 400, { error: "count must be a positive integer and timeoutMs a number of milliseconds." });
+      }
+      try {
+        return sendJson(res, 200, await waitForRequests(count, timeoutMs));
+      } catch (error) {
+        return sendJson(res, 408, { error: (error as Error).message, requests });
+      }
+    }
     if (req.method === "POST" && path === "/__mock/reset") {
       mock.reset();
       return sendJson(res, 200, { ok: true });
@@ -214,7 +349,9 @@ export async function startMockLLM(options: MockOptions = {}): Promise<MockLLM> 
       }
     }
     return sendJson(res, 404, {
-      error: `Unknown admin route ${req.method} ${path}. Use POST /__mock/replies, POST /__mock/rules, GET /__mock/requests or POST /__mock/reset.`,
+      error:
+        `Unknown admin route ${req.method} ${path}. Use POST /__mock/replies, POST /__mock/rules, GET /__mock/requests, ` +
+        `GET /__mock/wait?count=N or POST /__mock/reset.`,
     });
   }
 
@@ -241,6 +378,7 @@ export async function startMockLLM(options: MockOptions = {}): Promise<MockLLM> 
     port,
     openaiBaseURL: `${url}/v1`,
     anthropicBaseURL: url,
+    geminiBaseURL: url,
     requests,
     get lastRequest() {
       return requests.at(-1);
@@ -255,6 +393,9 @@ export async function startMockLLM(options: MockOptions = {}): Promise<MockLLM> 
     on(match, reply, opts = {}) {
       rules.push({ match, reply, times: opts.times ?? Infinity });
       return this;
+    },
+    waitForRequests(count = requests.length + 1, opts = {}) {
+      return waitForRequests(count, opts.timeoutMs ?? 5000);
     },
     assertDone() {
       if (queue.length > 0) {
@@ -297,17 +438,20 @@ function normalizeReply(
   options: MockOptions,
 ): ResolvedReply {
   const text = reply.json !== undefined ? JSON.stringify(reply.json) : (reply.text ?? "");
+  const reasoning = reply.reasoning ?? "";
   const toolCalls = (reply.toolCalls ?? []).map((call) => ({
     id: call.id ?? nextId(req.provider === "anthropic" ? "toolu_mock_" : "call_mock_"),
     name: call.name,
     arguments: typeof call.arguments === "string" ? call.arguments : JSON.stringify(call.arguments ?? {}),
+    idGiven: call.id !== undefined,
   }));
-  if (req.provider === "anthropic") {
+  if (req.provider === "anthropic" || req.provider === "gemini") {
     for (const call of toolCalls) {
       try {
         JSON.parse(call.arguments || "{}");
       } catch {
-        throw new Error(`tool call "${call.name}" has arguments that are not valid JSON, which Anthropic can't represent`);
+        const name = req.provider === "anthropic" ? "Anthropic" : "Gemini";
+        throw new Error(`tool call "${call.name}" has arguments that are not valid JSON, which ${name} can't represent`);
       }
     }
   }
@@ -320,17 +464,32 @@ function normalizeReply(
       }
     : undefined;
   const outputText = text + toolCalls.map((c) => c.name + c.arguments).join("");
+  const reasoningTokens = reply.usage?.reasoningTokens ?? (reasoning === "" ? 0 : estimateTokens(reasoning));
+  const streamError = reply.streamError
+    ? {
+        afterChunks: reply.streamError.afterChunks ?? 0,
+        message: reply.streamError.message ?? "Mock stream error",
+        status: reply.streamError.status ?? 500,
+        disconnect: reply.streamError.disconnect ?? false,
+        ...(reply.streamError.type === undefined ? {} : { type: reply.streamError.type }),
+      }
+    : undefined;
   return {
     text,
+    reasoning,
     toolCalls,
     error,
     stopReason: reply.stopReason ?? (toolCalls.length > 0 ? "tool_calls" : "stop"),
     inputTokens: reply.usage?.inputTokens ?? estimateTokens(JSON.stringify([req.system, req.messages, req.body.tools ?? []])),
-    outputTokens: reply.usage?.outputTokens ?? estimateTokens(outputText),
+    outputTokens: reply.usage?.outputTokens ?? estimateTokens(outputText) + reasoningTokens,
+    cachedInputTokens: reply.usage?.cachedInputTokens ?? 0,
+    cacheWriteTokens: reply.usage?.cacheWriteTokens ?? 0,
+    reasoningTokens,
     model: reply.model ?? req.model,
     delayMs: reply.delayMs ?? 0,
     chunkSize: reply.chunkSize,
     chunkDelayMs: reply.chunkDelayMs ?? options.chunkDelayMs ?? 0,
+    streamError,
   };
 }
 
@@ -355,9 +514,18 @@ function embeddings(res: ServerResponse, body: Record<string, unknown>): void {
   });
 }
 
-function listModels(res: ServerResponse, isAnthropic: boolean): void {
+function listModels(res: ServerResponse, provider: Provider): void {
   const ids = ["mock-model", "mock-model-mini"];
-  if (isAnthropic) {
+  if (provider === "gemini") {
+    return sendJson(res, 200, {
+      models: ids.map((id) => ({
+        name: `models/${id}`,
+        displayName: id,
+        supportedGenerationMethods: ["generateContent", "countTokens", "embedContent"],
+      })),
+    });
+  }
+  if (provider === "anthropic") {
     return sendJson(res, 200, {
       data: ids.map((id) => ({ type: "model", id, display_name: id, created_at: "2026-01-01T00:00:00Z" })),
       has_more: false,
@@ -368,12 +536,12 @@ function listModels(res: ServerResponse, isAnthropic: boolean): void {
   sendJson(res, 200, { object: "list", data: ids.map((id) => ({ id, object: "model", created: 1767225600, owned_by: "mock" })) });
 }
 
-function notFound(res: ServerResponse, method: string | undefined, path: string, isAnthropic: boolean): void {
+function notFound(res: ServerResponse, method: string | undefined, path: string, provider: Provider): void {
   const message =
     `mock-llm-server does not handle ${method} ${path}. Supported: POST /v1/chat/completions, POST /v1/responses, ` +
-    `POST /v1/embeddings, POST /v1/messages, POST /v1/messages/count_tokens, GET /v1/models.`;
-  const err = { status: 404, retryAfterMs: 0, message };
-  sendJson(res, 404, isAnthropic ? anthropic.errorBody(err) : openai.errorBody(err));
+    `POST /v1/embeddings, POST /v1/messages, POST /v1/messages/count_tokens, GET /v1/models, and Gemini's ` +
+    `POST /v1beta/models/<model>:generateContent, :streamGenerateContent, :countTokens, :embedContent and :batchEmbedContents.`;
+  sendJson(res, 404, errorBody(provider, { status: 404, retryAfterMs: 0, message }));
 }
 
 function readBody(req: IncomingMessage): Promise<string> {
@@ -389,7 +557,20 @@ function readBody(req: IncomingMessage): Promise<string> {
 export function checkJsonReply(value: unknown): Reply {
   if (typeof value === "string") return value;
   if (value && typeof value === "object" && !Array.isArray(value)) {
-    const known = ["text", "json", "toolCalls", "error", "stopReason", "usage", "model", "delayMs", "chunkSize", "chunkDelayMs"];
+    const known = [
+      "text",
+      "reasoning",
+      "json",
+      "toolCalls",
+      "error",
+      "stopReason",
+      "usage",
+      "model",
+      "delayMs",
+      "chunkSize",
+      "chunkDelayMs",
+      "streamError",
+    ];
     const unknown = Object.keys(value).filter((k) => !known.includes(k));
     if (unknown.length > 0) throw new Error(`Unknown reply field${unknown.length > 1 ? "s" : ""}: ${unknown.join(", ")}. Known: ${known.join(", ")}.`);
     return value as ReplyObject;
