@@ -62,7 +62,7 @@
     "prepack": "npm run build"
   },
   "devDependencies": {
-    "@anthropic-ai/sdk": "^0.135.0",
+    "@anthropic-ai/sdk": "^0.137.0",
     "@google/genai": "^2.27.0",
     "@types/node": "^24.19.2",
     "openai": "^7.38.0",
