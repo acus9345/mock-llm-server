@@ -181,7 +181,9 @@ describe("Anthropic Messages", () => {
     assert.equal(msg.stop_reason, "end_turn");
     assert.equal(mock.lastRequest?.provider, "anthropic");
     assert.equal(mock.lastRequest?.system, "Speak French");
-    assert.equal(mock.lastRequest?.headers["x-api-key"], "test");
+    // SDK 1.x sends the key as a bearer token; 0.x sent x-api-key.
+    const headers = mock.lastRequest?.headers;
+    assert.ok(headers?.["x-api-key"] === "test" || headers?.authorization === "Bearer test");
   });
 
   it("returns tool use and records tool results in the next turn", async () => {
