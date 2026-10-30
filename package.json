@@ -63,8 +63,8 @@
   },
   "devDependencies": {
     "@anthropic-ai/sdk": "^1.3.0",
-    "@google/genai": "^2.31.0",
-    "@types/node": "^26.6.5",
+    "@google/genai": "^2.32.0",
+    "@types/node": "^26.6.6",
     "openai": "^7.45.1",
     "typescript": "^7.0.2"
   }
