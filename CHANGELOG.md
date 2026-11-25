@@ -1,6 +1,11 @@
-# Changelog
+﻿# Changelog
 
 All notable changes to this project are documented here. This project follows [Semantic Versioning](https://semver.org/).
+
+## [0.2.1] - 2026-11-25
+
+### Fixed
+- Fix Node 24 SSE mid-stream disconnects, Gemini SSE error framing, embedding validation, waitForRequests cleanup on close, and CLI option validation.
 
 ## [0.2.0] - 2026-10-19
 
@@ -11,6 +16,11 @@ All notable changes to this project are documented here. This project follows [S
 - `streamError` replies that end a stream with the provider's error event after a number of chunks, or drop the connection.
 - `usage.cachedInputTokens`, `usage.cacheWriteTokens` and `usage.reasoningTokens`, sent in each provider's usage fields.
 - `mock.waitForRequests(count, { timeoutMs })` and the `GET /__mock/wait` admin route, for agents that run in the background.
+
+## [0.2.1] - 2026-11-25
+
+### Fixed
+- Fix Node 24 SSE mid-stream disconnects, Gemini SSE error framing, embedding validation, waitForRequests cleanup on close, and CLI option validation.
 
 ## [0.1.0] - 2026-10-18
 

@@ -1,6 +1,6 @@
 {
   "name": "mock-llm-server",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Fake OpenAI-, Anthropic- and Gemini-compatible API server that returns scripted replies, tool calls, reasoning, errors and streams, so you can test agents without API keys. Zero dependencies.",
   "keywords": [
     "llm",
