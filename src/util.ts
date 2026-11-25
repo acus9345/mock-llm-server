@@ -48,6 +48,9 @@ export class SseWriter {
     this.#res = res;
     this.#delay = delayMs;
     this.#failure = failure;
+    // Keep chunked framing open without `Connection: close` so a mid-stream disconnect looks like
+    // an unexpected drop rather than a normal end-of-response to HTTP clients.
+    if (failure?.disconnect) res.shouldKeepAlive = true;
     res.writeHead(200, {
       "content-type": "text/event-stream",
       "cache-control": "no-cache",

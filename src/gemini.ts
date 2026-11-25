@@ -1,6 +1,6 @@
 import type { ServerResponse } from "node:http";
 import type { RecordedRequest, ResolvedReply } from "./types.js";
-import { chunkText, contentText, estimateTokens, sendJson, SseWriter, type StreamFailure } from "./util.js";
+import { chunkText, contentText, estimateTokens, sendJson, sseEvent, SseWriter, type StreamFailure } from "./util.js";
 import { fakeEmbedding } from "./openai.js";
 
 type Parsed = Pick<RecordedRequest, "system" | "messages" | "lastUserMessage" | "tools">;
@@ -134,9 +134,9 @@ export function errorBody(error: NonNullable<ResolvedReply["error"]>): Record<st
   };
 }
 
-/** Gemini ends a failed stream with a bare JSON error object, not an SSE event. */
+/** Gemini ends a failed stream with an SSE data event containing the error object. */
 export function streamErrorEvent(error: NonNullable<ResolvedReply["error"]>): string {
-  return JSON.stringify(errorBody(error));
+  return sseEvent(errorBody(error));
 }
 
 export function countTokens(body: Record<string, unknown>): Record<string, unknown> {
@@ -148,7 +148,12 @@ export function countTokens(body: Record<string, unknown>): Record<string, unkno
 /** `embedContent` → `{ embedding }`, `batchEmbedContents` → `{ embeddings }`. Deterministic, like the OpenAI endpoint. */
 export function embed(method: string, body: Record<string, unknown>): Record<string, unknown> {
   const one = (request: Record<string, unknown>) => {
-    const dims = typeof request.outputDimensionality === "number" ? request.outputDimensionality : 768;
+    const dims =
+      typeof request.outputDimensionality === "number" &&
+      Number.isInteger(request.outputDimensionality) &&
+      request.outputDimensionality > 0
+        ? request.outputDimensionality
+        : 768;
     return { values: fakeEmbedding(partsText(request.content), dims) };
   };
   if (method === "batchEmbedContents") {

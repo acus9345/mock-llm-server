@@ -84,7 +84,7 @@ export async function startMockLLM(options: MockOptions = {}): Promise<MockLLM> 
   const queue: Reply[] = [...(options.replies ?? [])];
   const rules: Rule[] = [];
   const requests: RecordedRequest[] = [];
-  const waiters = new Set<() => void>();
+  const waiters = new Set<{ check: () => void; abort: (err: Error) => void }>();
   const counters = new Map<string, number>();
   const nextId = (prefix: string) => {
     const n = (counters.get(prefix) ?? 0) + 1;
@@ -233,7 +233,7 @@ export async function startMockLLM(options: MockOptions = {}): Promise<MockLLM> 
     };
     requests.push(recorded);
     options.onRequest?.(recorded);
-    for (const wake of waiters) wake();
+    for (const wake of [...waiters]) wake.check();
     return recorded;
   }
 
@@ -291,10 +291,16 @@ export async function startMockLLM(options: MockOptions = {}): Promise<MockLLM> 
   function waitForRequests(count: number, timeoutMs: number): Promise<RecordedRequest[]> {
     if (requests.length >= count) return Promise.resolve([...requests]);
     return new Promise((done, fail) => {
-      const check = () => {
-        if (requests.length < count) return;
-        cleanup();
-        done([...requests]);
+      const entry = {
+        check: () => {
+          if (requests.length < count) return;
+          cleanup();
+          done([...requests]);
+        },
+        abort: (err: Error) => {
+          cleanup();
+          fail(err);
+        },
       };
       const timer = setTimeout(() => {
         cleanup();
@@ -302,9 +308,9 @@ export async function startMockLLM(options: MockOptions = {}): Promise<MockLLM> 
       }, timeoutMs);
       const cleanup = () => {
         clearTimeout(timer);
-        waiters.delete(check);
+        waiters.delete(entry);
       };
-      waiters.add(check);
+      waiters.add(entry);
     });
   }
 
@@ -319,7 +325,8 @@ export async function startMockLLM(options: MockOptions = {}): Promise<MockLLM> 
       try {
         return sendJson(res, 200, await waitForRequests(count, timeoutMs));
       } catch (error) {
-        return sendJson(res, 408, { error: (error as Error).message, requests });
+        if (!res.destroyed && !res.writableEnded) return sendJson(res, 408, { error: (error as Error).message, requests });
+        return;
       }
     }
     if (req.method === "POST" && path === "/__mock/reset") {
@@ -391,6 +398,9 @@ export async function startMockLLM(options: MockOptions = {}): Promise<MockLLM> 
       return this;
     },
     on(match, reply, opts = {}) {
+      if (opts.times !== undefined && (typeof opts.times !== "number" || Number.isNaN(opts.times) || opts.times < 1)) {
+        throw new RangeError(`Rule "times" must be a positive number.`);
+      }
       rules.push({ match, reply, times: opts.times ?? Infinity });
       return this;
     },
@@ -410,6 +420,8 @@ export async function startMockLLM(options: MockOptions = {}): Promise<MockLLM> 
       return this;
     },
     close() {
+      const err = new Error("mock-llm-server: server closed while waiting for requests.");
+      for (const w of [...waiters]) w.abort(err);
       return new Promise<void>((done) => {
         server.close(() => done());
         server.closeAllConnections();
@@ -496,11 +508,11 @@ function normalizeReply(
 function embeddings(res: ServerResponse, body: Record<string, unknown>): void {
   const input = body.input;
   const items: unknown[] = Array.isArray(input) && input.every((x) => typeof x !== "number") ? input : [input];
-  const dims = typeof body.dimensions === "number" ? body.dimensions : 1536;
+  const dims = typeof body.dimensions === "number" && Number.isInteger(body.dimensions) && body.dimensions > 0 ? body.dimensions : 1536;
   const base64 = body.encoding_format === "base64";
   let tokens = 0;
   const data = items.map((item, index) => {
-    const text = typeof item === "string" ? item : JSON.stringify(item);
+    const text = typeof item === "string" ? item : (JSON.stringify(item) ?? "");
     tokens += estimateTokens(text);
     const vector = openai.fakeEmbedding(text, dims);
     const embedding = base64 ? Buffer.from(new Float32Array(vector).buffer).toString("base64") : vector;
@@ -580,7 +592,14 @@ export function checkJsonReply(value: unknown): Reply {
 
 /** Read a rule that arrived as JSON: `{ "match": "text" | { "regex": "...", "flags": "i" }, "reply": ..., "times": 1 }`. */
 export function parseJsonRule(value: unknown): { match: Matcher; reply: Reply; times?: number } {
-  if (!value || typeof value !== "object") throw new Error(`A rule must be an object like {"match": "weather", "reply": "Sunny"}.`);
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`A rule must be an object like {"match": "weather", "reply": "Sunny"}.`);
+  }
+  const known = ["match", "reply", "times"];
+  const unknown = Object.keys(value).filter((k) => !known.includes(k));
+  if (unknown.length > 0) {
+    throw new Error(`Unknown rule field${unknown.length > 1 ? "s" : ""}: ${unknown.join(", ")}. Known: ${known.join(", ")}.`);
+  }
   const rule = value as { match?: unknown; reply?: unknown; times?: unknown };
   let match: Matcher;
   if (typeof rule.match === "string") match = rule.match;
@@ -588,7 +607,7 @@ export function parseJsonRule(value: unknown): { match: Matcher; reply: Reply; t
     const m = rule.match as { regex: string; flags?: string };
     match = new RegExp(m.regex, m.flags ?? "");
   } else throw new Error(`Rule "match" must be a string or {"regex": "...", "flags": "i"}.`);
-  if (rule.times !== undefined && (typeof rule.times !== "number" || rule.times < 1)) {
+  if (rule.times !== undefined && (typeof rule.times !== "number" || !Number.isFinite(rule.times) || rule.times < 1)) {
     throw new Error(`Rule "times" must be a positive number.`);
   }
   const reply = checkJsonReply(rule.reply);

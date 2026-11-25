@@ -315,6 +315,8 @@ export function fakeEmbedding(text: string, dimensions: number): number[] {
     x >>>= 0;
     v.push((x / 0xffffffff) * 2 - 1);
   }
-  const norm = Math.hypot(...v) || 1;
+  let sumSq = 0;
+  for (const n of v) sumSq += n * n;
+  const norm = Math.sqrt(sumSq) || 1;
   return v.map((n) => Number((n / norm).toFixed(6)));
 }

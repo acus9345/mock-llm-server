@@ -9,10 +9,12 @@ Usage:
   mock-llm-server [--port 8787] [--script replies.json] [options]
 
 Starts a server that answers like the OpenAI (Chat Completions, Responses,
-Embeddings) and Anthropic (Messages) APIs with replies you script, including
-streaming and tool calls. Point your SDK's base URL at it:
+Embeddings), Anthropic (Messages, token counting) and Gemini (generateContent,
+embeddings, token counting) APIs with replies you script, including streaming
+and tool calls. Point your SDK's base URL at it:
   OpenAI:    <url>/v1   (OPENAI_BASE_URL)
   Anthropic: <url>      (ANTHROPIC_BASE_URL)
+  Gemini:    <url>      (GOOGLE_GEMINI_BASE_URL)
 
 Options:
   -p, --port <n>          Port to listen on. Default 8787 (0 picks a free port).
@@ -105,9 +107,11 @@ async function main(argv: string[]): Promise<number> {
     process.stdout.write(`${version()}\n`);
     return 0;
   }
-  const port = Number(values.port ?? process.env.PORT ?? 8787);
-  if (!Number.isInteger(port) || port < 0 || port > 65535) throw new UsageError(`--port must be 0-65535, not "${values.port}".`);
-  const chunkDelay = values["chunk-delay"] === undefined ? 0 : Number(values["chunk-delay"]);
+  const rawPort = values.port ?? process.env.PORT;
+  const port = rawPort === undefined ? 8787 : rawPort.trim() === "" ? NaN : Number(rawPort);
+  if (!Number.isInteger(port) || port < 0 || port > 65535) throw new UsageError(`--port must be 0-65535, not "${rawPort}".`);
+  const rawDelay = values["chunk-delay"];
+  const chunkDelay = rawDelay === undefined ? 0 : rawDelay.trim() === "" ? NaN : Number(rawDelay);
   if (!Number.isFinite(chunkDelay) || chunkDelay < 0) throw new UsageError(`--chunk-delay must be a number of milliseconds.`);
 
   const script = values.script ? loadScript(values.script) : { rules: [] };
@@ -134,7 +138,10 @@ async function main(argv: string[]): Promise<number> {
       `  Gemini base URL:    ${mock.geminiBaseURL}\n` +
       `Press Ctrl+C to stop.\n`,
   );
+  let closing = false;
   const stop = () => {
+    if (closing) return;
+    closing = true;
     void mock.close().then(() => process.exit(0));
   };
   process.on("SIGINT", stop);

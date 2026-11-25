@@ -9,7 +9,8 @@ const CLI = join(import.meta.dirname, "..", "dist", "cli.js");
 const dir = mkdtempSync(join(tmpdir(), "mock-llm-cli-"));
 after(() => rmSync(dir, { recursive: true, force: true }));
 
-const cli = (args: string[]) => spawnSync(process.execPath, [CLI, ...args], { encoding: "utf8", timeout: 10_000 });
+const cli = (args: string[], env?: NodeJS.ProcessEnv) =>
+  spawnSync(process.execPath, [CLI, ...args], { encoding: "utf8", timeout: 10_000, ...(env ? { env: { ...process.env, ...env } } : {}) });
 
 describe("cli", () => {
   it("prints help and version", () => {
@@ -25,6 +26,11 @@ describe("cli", () => {
     assert.equal(r.status, 2);
     assert.match(r.stderr, /Unknown reply field: txt/);
     assert.equal(cli(["--port", "99999"]).status, 2);
+    assert.equal(cli(["--port", ""]).status, 2);
+    assert.equal(cli(["--chunk-delay", ""]).status, 2);
+    const badEnvPort = cli([], { PORT: "abc" });
+    assert.equal(badEnvPort.status, 2);
+    assert.match(badEnvPort.stderr, /not "abc"/);
     assert.match(cli(["--script", join(dir, "missing.json")]).stderr, /can't find script/);
   });
 

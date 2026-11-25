@@ -222,12 +222,26 @@ describe("streamError", () => {
     await assert.rejects(stream.finalMessage(), (e: unknown) => e instanceof Anthropic.APIError && /Overloaded mid-stream/.test(e.message));
   });
 
-  it("Gemini: the SDK's stream throws", async () => {
+  it("Gemini: the SDK's stream throws ApiError", async () => {
     mock.reply({ text: "one two three", streamError: { afterChunks: 1, message: "Gemini broke" } });
     const stream = await gemini.models.generateContentStream({ model: "g", contents: "x" });
-    await assert.rejects(async () => {
-      for await (const _ of stream);
-    });
+    await assert.rejects(
+      async () => {
+        for await (const _ of stream);
+      },
+      (e: unknown) => e instanceof ApiError && /Gemini broke/.test(e.message),
+    );
+  });
+
+  it("Gemini: streamError after more chunks than the reply still throws ApiError", async () => {
+    mock.reply({ text: "short", streamError: { afterChunks: 99, message: "Late Gemini failure" } });
+    const stream = await gemini.models.generateContentStream({ model: "g", contents: "x" });
+    await assert.rejects(
+      async () => {
+        for await (const _ of stream);
+      },
+      (e: unknown) => e instanceof ApiError && /Late Gemini failure/.test(e.message),
+    );
   });
 
   it("a failure set after more chunks than the reply has still happens before the end", async () => {
@@ -238,7 +252,7 @@ describe("streamError", () => {
     }, /Late failure/);
   });
 
-  it("disconnect drops the connection mid-stream", async (t) => {
+  it("disconnect drops the connection mid-stream across providers", async (t) => {
     if (!(await loopbackDeliversLateWrites())) {
       t.skip("this machine's loopback drops TCP segments after the first, including the close (a VPN or firewall filter?)");
       return;
@@ -250,6 +264,21 @@ describe("streamError", () => {
       for await (const chunk of stream) if (chunk.choices[0]?.delta.content) parts.push(chunk.choices[0].delta.content);
     });
     assert.deepEqual(parts, ["one "]);
+
+    mock.reply({ text: "one two", streamError: { afterChunks: 0, disconnect: true } });
+    await assert.rejects(async () => {
+      const stream = await openai.chat.completions.create({ model: "m", messages: user("x"), stream: true });
+      for await (const _ of stream);
+    });
+
+    mock.reply({ text: "one two", streamError: { afterChunks: 1, disconnect: true } });
+    await assert.rejects(openai.responses.stream({ model: "m", input: "x" }).finalResponse());
+
+    mock.reply({ text: "one two", streamError: { afterChunks: 1, disconnect: true } });
+    const gStream = await gemini.models.generateContentStream({ model: "g", contents: "x" });
+    await assert.rejects(async () => {
+      for await (const _ of gStream);
+    });
   });
 
   it("disconnect drops a request that isn't streamed", async () => {
@@ -283,5 +312,39 @@ describe("waitForRequests", () => {
     assert.equal((await waiting)[0]?.lastUserMessage, "hello");
     const late = await fetch(`${mock.url}/__mock/wait?count=5&timeoutMs=20`);
     assert.equal(late.status, 408);
+  });
+
+  it("rejects pending waiters when closed", async () => {
+    const temp = await startMockLLM();
+    const pending = temp.waitForRequests(1, { timeoutMs: 30_000 });
+    await temp.close();
+    await assert.rejects(pending, /server closed while waiting for requests/);
+  });
+});
+
+describe("validation", () => {
+  it("rejects non-positive rule times and unknown JSON rule fields", async () => {
+    assert.throws(() => mock.on("hi", "ok", { times: 0 }), /Rule "times" must be a positive number/);
+    const badRule = await fetch(`${mock.url}/__mock/rules`, {
+      method: "POST",
+      body: JSON.stringify({ match: "hi", reply: "ok", time: 1 }),
+    });
+    assert.equal(badRule.status, 400);
+    assert.match(((await badRule.json()) as { error: string }).error, /Unknown rule field: time/);
+  });
+
+  it("handles missing embedding input and invalid dimensions safely", async () => {
+    const res = await fetch(`${mock.url}/v1/embeddings`, { method: "POST", body: JSON.stringify({ model: "m" }) });
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { data: { embedding: number[] }[] };
+    assert.equal(body.data[0]?.embedding.length, 1536);
+
+    const gemRes = await fetch(`${mock.url}/v1beta/models/e:embedContent`, {
+      method: "POST",
+      body: JSON.stringify({ content: { parts: [{ text: "cat" }] }, outputDimensionality: -5 }),
+    });
+    assert.equal(gemRes.status, 200);
+    const gemBody = (await gemRes.json()) as { embedding: { values: number[] } };
+    assert.equal(gemBody.embedding.values.length, 768);
   });
 });
